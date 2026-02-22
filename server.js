@@ -3,24 +3,25 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const fs = require('fs').promises;
 const path = require('path');
-const crypto = require('crypto');
+const linkvertise = require('@hydren/linkvertise'); // ADD THIS PACKAGE
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
+// ==================== CONFIGURE LINKVERTISE ====================
+// Your Linkvertise User ID
+const LINKVERTISE_USER_ID = '1446949';
+linkvertise.config(LINKVERTISE_USER_ID);
+
+// ==================== MIDDLEWARE ====================
 app.use(cors({ origin: '*' }));
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Your Linkvertise User ID
-const LINKVERTISE_USER_ID = '1446949';
-
-// Simple JSON database
+// ==================== SIMPLE JSON DATABASE ====================
 const DB_PATH = path.join(__dirname, 'db', 'keys.json');
 
-// Ensure db directory exists
 async function initDB() {
   try {
     await fs.mkdir(path.join(__dirname, 'db'), { recursive: true });
@@ -38,36 +39,80 @@ async function initDB() {
   }
 }
 
-// Read database
 async function readDB() {
   const data = await fs.readFile(DB_PATH, 'utf8');
   return JSON.parse(data);
 }
 
-// Write database
 async function writeDB(data) {
   await fs.writeFile(DB_PATH, JSON.stringify(data, null, 2));
 }
 
-// ==================== GENERATE LINKVERTISE LINK ====================
-function generateLinkvertiseLink(userId, scriptId, keyIndex, baseUrl) {
-  // Create callback URL
-  const callbackUrl = `${baseUrl}/callback?user_id=${userId}&script_id=${scriptId}&key_index=${keyIndex}`;
+// ==================== ON COMPLETE CALLBACK FUNCTION ====================
+// This runs when user successfully completes the Linkvertise ad
+async function onLinkvertiseComplete(req) {
+  console.log('✅ Linkvertise completion detected:', req.query);
   
-  // Generate Linkvertise link with your user ID
-  // Format: https://link-to.net/USER_ID/CAMPAIGN_ID/dynamic?callback=URL
-  // Using a generic campaign ID - you can customize this
-  const campaignId = Math.floor(Math.random() * 1000000); // Random campaign ID
-  const linkvertiseUrl = `https://link-to.net/${LINKVERTISE_USER_ID}/${campaignId}/dynamic?callback=${encodeURIComponent(callbackUrl)}`;
+  // Extract parameters (the package passes these automatically)
+  const { user_id, script_id, key_index } = req.query;
   
-  return {
-    linkvertiseUrl,
-    callbackUrl,
-    campaignId
-  };
+  console.log('📊 Completion data:', { user_id, script_id, key_index });
+
+  if (!user_id || !script_id || key_index === undefined) {
+    console.error('❌ Missing required parameters');
+    return;
+  }
+
+  try {
+    const db = await readDB();
+
+    // Initialize user if not exists
+    if (!db.users[user_id]) {
+      db.users[user_id] = {
+        completedKeys: {},
+        lastActive: new Date().toISOString()
+      };
+    }
+
+    // Initialize script for user
+    if (!db.users[user_id].completedKeys[script_id]) {
+      db.users[user_id].completedKeys[script_id] = [];
+    }
+
+    // Mark key as completed
+    const keyIndexNum = parseInt(key_index);
+    if (!db.users[user_id].completedKeys[script_id].includes(keyIndexNum)) {
+      db.users[user_id].completedKeys[script_id].push(keyIndexNum);
+      
+      // Track in completed list
+      if (!db.completed[script_id]) db.completed[script_id] = [];
+      db.completed[script_id].push({
+        userId: user_id,
+        keyIndex: keyIndexNum,
+        timestamp: new Date().toISOString()
+      });
+
+      console.log(`✅ Key ${keyIndexNum} completed for user ${user_id}`);
+    }
+
+    db.users[user_id].lastActive = new Date().toISOString();
+    await writeDB(db);
+
+  } catch (error) {
+    console.error('❌ Error in onComplete:', error);
+  }
 }
 
-// ==================== ENDPOINT TO GET LINKVERTISE LINK ====================
+// ==================== MOUNT LINKVERTISE ROUTES ====================
+// This creates /go and /callback endpoints automatically
+app.use(linkvertise.create({
+  type: 'router',
+  path: '/go',                    // Users go to /go?user_id=...&script_id=...&key_index=...
+  finalPath: '/callback',          // Linkvertise redirects here after ad
+  onComplete: onLinkvertiseComplete
+}));
+
+// ==================== ENDPOINT TO GENERATE LINK (FOR FRONTEND) ====================
 app.post('/api/get-linkvertise-link', async (req, res) => {
   try {
     const { userId, scriptId, keyIndex } = req.body;
@@ -76,16 +121,10 @@ app.post('/api/get-linkvertise-link', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // Generate the full URL for callbacks
+    // Generate the URL that users will click
+    // This goes to YOUR /go endpoint, which then redirects to Linkvertise
     const baseUrl = `${req.protocol}://${req.get('host')}`;
-    
-    // Generate Linkvertise link
-    const { linkvertiseUrl, callbackUrl, campaignId } = generateLinkvertiseLink(
-      userId, 
-      scriptId, 
-      keyIndex,
-      baseUrl
-    );
+    const goUrl = `${baseUrl}/go?user_id=${userId}&script_id=${scriptId}&key_index=${keyIndex}`;
 
     // Store in pending
     const db = await readDB();
@@ -94,18 +133,16 @@ app.post('/api/get-linkvertise-link', async (req, res) => {
       userId,
       scriptId,
       keyIndex,
-      campaignId,
       timestamp: new Date().toISOString(),
-      callbackUrl
+      goUrl
     };
     await writeDB(db);
 
-    console.log(`🔗 Generated Linkvertise link for user ${userId}, script ${scriptId}, key ${keyIndex}`);
-    
+    console.log(`🔗 Generated go link for user ${userId}, script ${scriptId}, key ${keyIndex}`);
+
     res.json({ 
       success: true, 
-      linkvertiseUrl,
-      callbackUrl
+      linkvertiseUrl: goUrl  // Send the /go URL to frontend
     });
 
   } catch (error) {
@@ -114,77 +151,10 @@ app.post('/api/get-linkvertise-link', async (req, res) => {
   }
 });
 
-// ==================== CALLBACK ENDPOINT ====================
-app.get('/callback', async (req, res) => {
-  console.log('📩 Linkvertise callback received:', req.query);
-  
-  // Extract parameters
-  const userId = req.query.user_id;
-  const scriptId = req.query.script_id;
-  const keyIndex = req.query.key_index;
-  
-  console.log('✅ Extracted params:', { userId, scriptId, keyIndex });
-
-  if (!userId || !scriptId || keyIndex === undefined) {
-    console.error('❌ Missing parameters!');
-    return res.redirect('https://dikilia.github.io/lokus-hub?error=missing_params');
-  }
-
-  try {
-    // Read database
-    const db = await readDB();
-
-    // Initialize user if not exists
-    if (!db.users[userId]) {
-      db.users[userId] = {
-        completedKeys: {},
-        lastActive: new Date().toISOString()
-      };
-    }
-
-    // Initialize script for user
-    if (!db.users[userId].completedKeys[scriptId]) {
-      db.users[userId].completedKeys[scriptId] = [];
-    }
-
-    // Mark key as completed
-    const keyIndexNum = parseInt(keyIndex);
-    if (!db.users[userId].completedKeys[scriptId].includes(keyIndexNum)) {
-      db.users[userId].completedKeys[scriptId].push(keyIndexNum);
-      
-      // Track in completed list
-      if (!db.completed[scriptId]) db.completed[scriptId] = [];
-      db.completed[scriptId].push({
-        userId,
-        keyIndex: keyIndexNum,
-        timestamp: new Date().toISOString()
-      });
-
-      console.log(`✅ Key ${keyIndexNum} completed for user ${userId}`);
-    }
-
-    // Remove from pending
-    if (db.pending[`${userId}:${scriptId}:${keyIndexNum}`]) {
-      delete db.pending[`${userId}:${scriptId}:${keyIndexNum}`];
-    }
-
-    db.users[userId].lastActive = new Date().toISOString();
-    await writeDB(db);
-
-    // Redirect back to frontend
-    res.redirect(`https://dikilia.github.io/lokus-hub?completed=1&key=${keyIndexNum}&script=${scriptId}&user=${userId}`);
-
-  } catch (error) {
-    console.error('❌ Callback error:', error);
-    res.redirect('https://dikilia.github.io/lokus-hub?error=server_error');
-  }
-});
-
 // ==================== CHECK KEY STATUS ====================
 app.get('/api/status/:userId/:scriptId', async (req, res) => {
   try {
     const { userId, scriptId } = req.params;
-    console.log('🔍 Status check for:', { userId, scriptId });
     
     const db = await readDB();
     const user = db.users[userId];
@@ -204,42 +174,23 @@ app.get('/api/status/:userId/:scriptId', async (req, res) => {
   }
 });
 
-// ==================== ADMIN: VIEW STATS ====================
-app.get('/admin/stats', async (req, res) => {
-  const auth = req.headers.authorization;
-  if (auth !== `Bearer ${process.env.ADMIN_PASSWORD || 'noobie123admin'}`) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  try {
-    const db = await readDB();
-    
-    const stats = {
-      totalUsers: Object.keys(db.users || {}).length,
-      totalCompletions: Object.values(db.completed || {}).reduce((sum, arr) => sum + arr.length, 0),
-      pendingCount: Object.keys(db.pending || {}).length,
-      users: db.users,
-      completions: db.completed,
-      pending: db.pending,
-      linkvertiseUserId: LINKVERTISE_USER_ID,
-      serverTime: new Date().toISOString()
-    };
-
-    res.json(stats);
-
-  } catch (error) {
-    console.error('Stats error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
 // ==================== HEALTH CHECK ====================
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
     linkvertiseUserId: LINKVERTISE_USER_ID,
-    endpoints: ['/api/get-linkvertise-link', '/callback', '/api/status/:userId/:scriptId', '/admin/stats']
+    endpoints: ['/go', '/callback', '/api/get-linkvertise-link', '/api/status/:userId/:scriptId']
+  });
+});
+
+// ==================== DEBUG ENDPOINT ====================
+app.get('/debug', (req, res) => {
+  res.json({
+    message: 'Debug info',
+    query: req.query,
+    headers: req.headers,
+    url: req.url
   });
 });
 
@@ -247,13 +198,14 @@ app.get('/health', (req, res) => {
 initDB().then(() => {
   app.listen(PORT, () => {
     console.log('✅ ' + '='.repeat(50));
-    console.log(`✅ Linkvertise callback server running on port ${PORT}`);
+    console.log(`✅ Linkvertise server running on port ${PORT}`);
     console.log(`✅ Linkvertise User ID: ${LINKVERTISE_USER_ID}`);
     console.log('✅ ' + '='.repeat(50));
-    console.log(`📡 Get Linkvertise link: POST /api/get-linkvertise-link`);
-    console.log(`📡 Callback URL: GET /callback`);
+    console.log(`📡 Generate link: POST /api/get-linkvertise-link`);
+    console.log(`📡 User click endpoint: GET /go (auto-generated by package)`);
+    console.log(`📡 Callback endpoint: GET /callback (auto-generated by package)`);
     console.log(`📡 Status check: GET /api/status/:userId/:scriptId`);
-    console.log(`📡 Admin stats: GET /admin/stats`);
+    console.log(`📡 Health: GET /health`);
     console.log('✅ ' + '='.repeat(50));
   });
 });
