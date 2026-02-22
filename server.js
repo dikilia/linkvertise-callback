@@ -14,6 +14,9 @@ app.use(cors({ origin: '*' }));
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
+// Your Linkvertise User ID
+const LINKVERTISE_USER_ID = '1446949';
+
 // Simple JSON database
 const DB_PATH = path.join(__dirname, 'db', 'keys.json');
 
@@ -24,7 +27,6 @@ async function initDB() {
     try {
       await fs.access(DB_PATH);
     } catch {
-      // Create empty DB if doesn't exist
       await fs.writeFile(DB_PATH, JSON.stringify({ 
         pending: {}, 
         completed: {},
@@ -47,28 +49,85 @@ async function writeDB(data) {
   await fs.writeFile(DB_PATH, JSON.stringify(data, null, 2));
 }
 
-// ==================== FIXED LINKVERTISE CALLBACK ENDPOINT ====================
-// This handles the redirect from Linkvertise after user completes ad
+// ==================== GENERATE LINKVERTISE LINK ====================
+function generateLinkvertiseLink(userId, scriptId, keyIndex, baseUrl) {
+  // Create callback URL
+  const callbackUrl = `${baseUrl}/callback?user_id=${userId}&script_id=${scriptId}&key_index=${keyIndex}`;
+  
+  // Generate Linkvertise link with your user ID
+  // Format: https://link-to.net/USER_ID/CAMPAIGN_ID/dynamic?callback=URL
+  // Using a generic campaign ID - you can customize this
+  const campaignId = Math.floor(Math.random() * 1000000); // Random campaign ID
+  const linkvertiseUrl = `https://link-to.net/${LINKVERTISE_USER_ID}/${campaignId}/dynamic?callback=${encodeURIComponent(callbackUrl)}`;
+  
+  return {
+    linkvertiseUrl,
+    callbackUrl,
+    campaignId
+  };
+}
+
+// ==================== ENDPOINT TO GET LINKVERTISE LINK ====================
+app.post('/api/get-linkvertise-link', async (req, res) => {
+  try {
+    const { userId, scriptId, keyIndex } = req.body;
+    
+    if (!userId || !scriptId || keyIndex === undefined) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    // Generate the full URL for callbacks
+    const baseUrl = `${req.protocol}://${req.get('host')}`;
+    
+    // Generate Linkvertise link
+    const { linkvertiseUrl, callbackUrl, campaignId } = generateLinkvertiseLink(
+      userId, 
+      scriptId, 
+      keyIndex,
+      baseUrl
+    );
+
+    // Store in pending
+    const db = await readDB();
+    if (!db.pending) db.pending = {};
+    db.pending[`${userId}:${scriptId}:${keyIndex}`] = {
+      userId,
+      scriptId,
+      keyIndex,
+      campaignId,
+      timestamp: new Date().toISOString(),
+      callbackUrl
+    };
+    await writeDB(db);
+
+    console.log(`🔗 Generated Linkvertise link for user ${userId}, script ${scriptId}, key ${keyIndex}`);
+    
+    res.json({ 
+      success: true, 
+      linkvertiseUrl,
+      callbackUrl
+    });
+
+  } catch (error) {
+    console.error('Generate link error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ==================== CALLBACK ENDPOINT ====================
 app.get('/callback', async (req, res) => {
-  console.log('📩 Linkvertise callback received - Full query:', req.query);
-  console.log('📩 Full URL:', req.protocol + '://' + req.get('host') + req.originalUrl);
+  console.log('📩 Linkvertise callback received:', req.query);
   
-  // Linkvertise might send parameters in different formats
-  // Try to extract from various possible parameter names
-  const userId = req.query.user_id || req.query.userId || req.query.id || req.query.uid;
-  const scriptId = req.query.script_id || req.query.scriptId || req.query.sid;
-  const keyIndex = req.query.key_index || req.query.keyIndex || req.query.ki;
+  // Extract parameters
+  const userId = req.query.user_id;
+  const scriptId = req.query.script_id;
+  const keyIndex = req.query.key_index;
   
-  // Also check if parameters are in the path or nested
   console.log('✅ Extracted params:', { userId, scriptId, keyIndex });
 
-  // If missing data, redirect to frontend with error
   if (!userId || !scriptId || keyIndex === undefined) {
-    console.error('❌ Missing required parameters. Query was:', req.query);
-    console.error('❌ Headers:', req.headers);
-    
-    // Still redirect back to frontend so user isn't stuck
-    return res.redirect('https://dikilia.github.io/lokus-hub?error=missing_data&details=' + encodeURIComponent(JSON.stringify(req.query)));
+    console.error('❌ Missing parameters!');
+    return res.redirect('https://dikilia.github.io/lokus-hub?error=missing_params');
   }
 
   try {
@@ -88,23 +147,23 @@ app.get('/callback', async (req, res) => {
       db.users[userId].completedKeys[scriptId] = [];
     }
 
-    // Mark key as completed if not already
+    // Mark key as completed
     const keyIndexNum = parseInt(keyIndex);
     if (!db.users[userId].completedKeys[scriptId].includes(keyIndexNum)) {
       db.users[userId].completedKeys[scriptId].push(keyIndexNum);
       
-      // Also store in completed list for tracking
+      // Track in completed list
       if (!db.completed[scriptId]) db.completed[scriptId] = [];
       db.completed[scriptId].push({
-        userId: userId,
+        userId,
         keyIndex: keyIndexNum,
         timestamp: new Date().toISOString()
       });
 
-      console.log(`✅ Key ${keyIndexNum} for script ${scriptId} completed by user ${userId}`);
+      console.log(`✅ Key ${keyIndexNum} completed for user ${userId}`);
     }
 
-    // Remove from pending if exists
+    // Remove from pending
     if (db.pending[`${userId}:${scriptId}:${keyIndexNum}`]) {
       delete db.pending[`${userId}:${scriptId}:${keyIndexNum}`];
     }
@@ -112,64 +171,12 @@ app.get('/callback', async (req, res) => {
     db.users[userId].lastActive = new Date().toISOString();
     await writeDB(db);
 
-    // Redirect user back to frontend with success
-    res.redirect(`https://dikilia.github.io/lokus-hub?completed=1&key=${keyIndexNum}&script=${scriptId}`);
+    // Redirect back to frontend
+    res.redirect(`https://dikilia.github.io/lokus-hub?completed=1&key=${keyIndexNum}&script=${scriptId}&user=${userId}`);
 
   } catch (error) {
-    console.error('Callback error:', error);
+    console.error('❌ Callback error:', error);
     res.redirect('https://dikilia.github.io/lokus-hub?error=server_error');
-  }
-});
-
-// ==================== GENERATE LINKVERTISE LINK ====================
-// Frontend calls this to get a signed Linkvertise link
-app.post('/api/generate-link', async (req, res) => {
-  try {
-    const { userId, scriptId, keyIndex, linkvertiseUrl } = req.body;
-
-    console.log('📤 Generating link for:', { userId, scriptId, keyIndex, linkvertiseUrl });
-
-    if (!userId || !scriptId || keyIndex === undefined || !linkvertiseUrl) {
-      return res.status(400).json({ error: 'Missing required fields', received: req.body });
-    }
-
-    // Generate signature for verification
-    const signature = crypto
-      .createHash('sha256')
-      .update(`${userId}:${scriptId}:${keyIndex}:${process.env.CALLBACK_SECRET || 'default-secret-change-me'}`)
-      .digest('hex');
-
-    // Create callback URL with all parameters
-    const callbackUrl = `${req.protocol}://${req.get('host')}/callback?user_id=${userId}&script_id=${scriptId}&key_index=${keyIndex}&sig=${signature}`;
-    
-    // Add our parameters to Linkvertise link
-    // Linkvertise format: https://link-to.net/USER_ID/CAMPAIGN_ID/dynamic?callback=URL
-    const separator = linkvertiseUrl.includes('?') ? '&' : '?';
-    const finalUrl = `${linkvertiseUrl}${separator}callback=${encodeURIComponent(callbackUrl)}`;
-
-    // Store in pending
-    const db = await readDB();
-    if (!db.pending) db.pending = {};
-    db.pending[`${userId}:${scriptId}:${keyIndex}`] = {
-      userId,
-      scriptId,
-      keyIndex,
-      timestamp: new Date().toISOString(),
-      linkvertiseUrl: finalUrl,
-      callbackUrl
-    };
-    await writeDB(db);
-
-    res.json({ 
-      success: true, 
-      linkvertiseUrl: finalUrl,
-      callbackUrl,
-      debug: { userId, scriptId, keyIndex }
-    });
-
-  } catch (error) {
-    console.error('Generate link error:', error);
-    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
@@ -214,6 +221,7 @@ app.get('/admin/stats', async (req, res) => {
       users: db.users,
       completions: db.completed,
       pending: db.pending,
+      linkvertiseUserId: LINKVERTISE_USER_ID,
       serverTime: new Date().toISOString()
     };
 
@@ -230,18 +238,8 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
-    endpoints: ['/callback', '/api/generate-link', '/api/status/:userId/:scriptId', '/admin/stats']
-  });
-});
-
-// ==================== DEBUG ENDPOINT ====================
-app.get('/debug', (req, res) => {
-  res.json({
-    message: 'Debug info',
-    query: req.query,
-    headers: req.headers,
-    url: req.url,
-    method: req.method
+    linkvertiseUserId: LINKVERTISE_USER_ID,
+    endpoints: ['/api/get-linkvertise-link', '/callback', '/api/status/:userId/:scriptId', '/admin/stats']
   });
 });
 
@@ -250,14 +248,12 @@ initDB().then(() => {
   app.listen(PORT, () => {
     console.log('✅ ' + '='.repeat(50));
     console.log(`✅ Linkvertise callback server running on port ${PORT}`);
-    console.log(`✅ Server URL: http://localhost:${PORT}`);
-    console.log(`✅ Public URL: ${process.env.PUBLIC_URL || 'Not set'}`);
+    console.log(`✅ Linkvertise User ID: ${LINKVERTISE_USER_ID}`);
     console.log('✅ ' + '='.repeat(50));
-    console.log(`📡 Callback URL: /callback`);
-    console.log(`📡 Generate link: /api/generate-link`);
-    console.log(`📡 Status check: /api/status/:userId/:scriptId`);
-    console.log(`📡 Admin stats: /admin/stats`);
-    console.log(`📡 Debug: /debug`);
+    console.log(`📡 Get Linkvertise link: POST /api/get-linkvertise-link`);
+    console.log(`📡 Callback URL: GET /callback`);
+    console.log(`📡 Status check: GET /api/status/:userId/:scriptId`);
+    console.log(`📡 Admin stats: GET /admin/stats`);
     console.log('✅ ' + '='.repeat(50));
   });
 });
